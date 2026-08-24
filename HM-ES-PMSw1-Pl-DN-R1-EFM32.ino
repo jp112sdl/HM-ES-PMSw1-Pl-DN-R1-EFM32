@@ -11,6 +11,7 @@
 #define USE_HW_SERIAL
 #define HIDE_IGNORE_MSG
 
+#include <math.h>
 #include <SPI.h>
 #include <AskSinPP.h>
 #include <Switch.h>
@@ -26,15 +27,52 @@
 #define LED2_PIN              PA0 //ROT
 #define CS5490_RST            PB11
 #define CS5490_DO             PA2
-#define R7                    0.75
-#define R4                    390.0
-#define R5                    390.0
-#define R6                    390.0
-#define V_FS_RMS_V            0.17678
-#define V_FS                  0.6
+
+// Hardware (siehe additional/Schaltplan.png)
+#define R7                    0.75          // kOhm, unterer Zweig Spannungsteiler
+#define R4                    390.0         // kOhm
+#define R5                    390.0         // kOhm
+#define R6                    390.0         // kOhm
+#define R_SHUNT               0.002         // Ohm, R1
+#define V_DIVIDER             (R7 / (R4 + R5 + R6 + R7))          // 6.40615e-4
+
+// CS5490 (Datenblatt DS982F3)
+// V_RMS / I_RMS sind auf den Full-Scale-Peak des jeweiligen Kanals normiert (0..1),
+// V_GAIN / I_GAIN werden vom Chip in den Signalpfad multipliziert -> zum
+// Rueckrechnen dividieren.
+#define V_FS_PEAK             0.250         // V, Full-Scale-Peak Spannungskanal
+#define I_FS_PEAK             0.050         // V, Full-Scale-Peak Stromkanal @ IPGA = 50x
+#define OWR                   4000.0        // Output Word Rate = MCLK / 1024
+
 #define V_GAIN_S              0.9003636
 #define I_GAIN_S              0.3808553
-#define MULTIPLIER            414.09759786948
+
+// Empirischer Abgleich gegen Referenzmessgeraet.
+// NICHT ueber V_GAIN_S / I_GAIN_S abgleichen - die werden in den Chip geschrieben
+// und kuerzen sich aus dem Ergebnis wieder heraus.
+//
+// V_CAL = 231,0 V (Multimeter) / 247,0 V (Sketch mit V_CAL = 1,0).
+// Der Spannungsteiler ist bauteilseitig bestaetigt (R4..R6 = 3903, R7 = 7500), die
+// Abweichung sitzt also in der absoluten Kanalverstaerkung des CS5490: der
+// Full-Scale-Pegel skaliert direkt mit VREF, und VREF ist mit 2,3..2,5 V (typ 2,4 V)
+// spezifiziert. Genau dafuer gibt es SysGAIN bzw. den Werksabgleich von eQ-3.
+// SysGAIN scheidet hier aus - laut Datenblatt nur +-5 % um 1,25 verstellen, und es
+// wuerde beide Kanaele gleichzeitig verschieben.
+//
+// I_CAL noch nicht abgeglichen. Der VREF-Anteil des Fehlers ist beiden Kanaelen
+// gemeinsam, die Verstaerker-Toleranz nicht - also separat gegen eine bekannte
+// ohmsche Last messen und nicht einfach V_CAL uebernehmen.
+#define V_CAL                 0.935223      // 231.0 / 247.0
+#define I_CAL                 1.0
+
+// Registerwert (0..1) -> physikalische Einheit
+#define K_VOLT                (V_FS_PEAK / (V_GAIN_S * V_DIVIDER) * V_CAL)   // ~405.36 V
+#define K_AMP                 (I_FS_PEAK / (I_GAIN_S * R_SHUNT)  * I_CAL)    //  ~65.64 A
+#define K_WATT                (K_VOLT * K_AMP)                               // ~26611  W
+
+// Status0 Bits
+#define STATUS0_DRDY          0x800000UL
+#define STATUS0_FUP           0x000010UL
 
 
 #define RELAY_PIN             PB7
@@ -423,22 +461,32 @@ class MixDevice : public ChannelDevice<Hal, VirtBaseChannel<Hal, PMSw1List0>, 6,
           }
 
           if (avgCounter < averaging) {
+            static double lastFreqHz = 0.0;
 
-            float status0 = cs5490.readRegister(CS5490::STATUS0);
-            if (status0 == 0xC00030) {
-              double Vrms = cs5490.readRegister(CS5490::V_RMS);
-              double V = Vrms * MULTIPLIER;//V_FS_RMS_V / V_FS *  V_GAIN_S / (R7 / ((R4+R5+R6)+R7) );
-              Voltage += (double)V * 10UL;
+            uint32_t status0 = cs5490.readRawRegister(CS5490::STATUS0);
 
-              double Freq = cs5490.readRegister(CS5490::EPSILON);
-              Frequency += Freq * 4000UL;
+            // FUP = Epsilon (Netzfrequenz) aktualisiert
+            if (status0 & STATUS0_FUP) {
+              cs5490.writeRawRegister(CS5490::STATUS0, STATUS0_FUP);
+              lastFreqHz = (double)cs5490.readRegister(CS5490::EPSILON) * OWR;
+            }
 
-              double C = cs5490.readRegister(CS5490::I_RMS) * I_GAIN_S;
-              Current += C * 10UL;
+            // DRDY = neue Low-Rate-Ergebnisse (P_AVG / I_RMS / V_RMS)
+            if (status0 & STATUS0_DRDY) {
+              cs5490.writeRawRegister(CS5490::STATUS0, STATUS0_DRDY);
 
-              double Pavg = cs5490.readRegister(CS5490::P_AVG);
-              Power += Pavg * 100UL;
+              double pavg = cs5490.readRegister(CS5490::P_AVG);   // -1.0 .. +1.0 (vorzeichenbehaftet)
+              double irms = cs5490.readRegister(CS5490::I_RMS);   //  0.0 .. +1.0
+              double vrms = cs5490.readRegister(CS5490::V_RMS);   //  0.0 .. +1.0
 
+              double V = vrms * K_VOLT;         // Volt
+              double I = irms * K_AMP;          // Ampere
+              double P = fabs(pavg) * K_WATT;   // Watt
+
+              Voltage   += (uint32_t)(V * 10.0   + 0.5);   // 0,1 V
+              Current   += (uint32_t)(I * 1000.0 + 0.5);   // mA
+              Power     += (uint32_t)(P * 100.0  + 0.5);   // 0,01 W
+              Frequency += (uint32_t)(lastFreqHz + 0.5);   // Hz
 
               avgCounter++;
             }

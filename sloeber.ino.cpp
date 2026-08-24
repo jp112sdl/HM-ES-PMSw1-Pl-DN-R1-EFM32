@@ -2,12 +2,13 @@
 //This is a automatic generated file
 //Please do not modify this file
 //If you touch this file your change will be overwritten during the next build
-//This file has been generated on 2026-08-20 10:19:54
+//This file has been generated on 2026-08-24 20:22:11
 
 #include "Arduino.h"
 #define NDEBUG
 #define USE_HW_SERIAL
 #define HIDE_IGNORE_MSG
+#include <math.h>
 #include <SPI.h>
 #include <AskSinPP.h>
 #include <Switch.h>

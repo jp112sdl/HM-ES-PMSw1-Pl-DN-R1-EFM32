@@ -449,6 +449,13 @@ class MixDevice : public ChannelDevice<Hal, VirtBaseChannel<Hal, PMSw1List0>, 6,
           static uint32_t Frequency  = 0;
           static uint8_t  avgCounter = 0;
 
+          // Energiezaehler. Der CS5490 hat kein Energieregister (PSUM ist beim
+          // einkanaligen Typ identisch mit PAVG), also hier aufintegrieren.
+          // Einheit Milliwattsekunden, damit ohne Rundungsdrift in Ganzzahl
+          // summiert werden kann: 1 W * 1 ms = 1 mWs.
+          static uint64_t energy_mWs   = 0;
+          static uint32_t energyMillis = 0;   // Zeitstempel der letzten Integration
+
 
           if (resetAverageCounting == true) {
             //DPRINTLN(F("*** RESETTING AVERAGING ***"));
@@ -488,6 +495,18 @@ class MixDevice : public ChannelDevice<Hal, VirtBaseChannel<Hal, PMSw1List0>, 6,
               Power     += (uint32_t)(P * 100.0  + 0.5);   // 0,01 W
               Frequency += (uint32_t)(lastFreqHz + 0.5);   // Hz
 
+              // Energie ueber die tatsaechlich verstrichene Zeit integrieren, nicht
+              // ueber CS5490_MEASURE_INTERVAL - sonst laeuft der Zaehler mit jedem
+              // ausgefallenen oder verzoegerten Durchlauf weiter auseinander.
+              uint32_t nowMillis = millis();
+              if (energyMillis != 0) {
+                uint32_t dt = nowMillis - energyMillis;   // Ueberlauf via uint32 korrekt
+                if (relayOn() && dt <= 60000) {           // Ausreisser nach Blockade verwerfen
+                  energy_mWs += (uint64_t)(P * (double)dt + 0.5);
+                }
+              }
+              energyMillis = nowMillis;
+
               avgCounter++;
             }
 
@@ -500,7 +519,10 @@ class MixDevice : public ChannelDevice<Hal, VirtBaseChannel<Hal, PMSw1List0>, 6,
 
           }
 
-          /* actualValues.E_Counter = (hlw8012.getEnergy()  / 3600.0)   * 10; */
+          // 0,1 Wh, wie vom HM-Protokoll erwartet. 1 Wh = 3.600.000 mWs.
+          // Das Telegramm fuehrt den Zaehler mit 23 Bit, laeuft also bei
+          // 838.860,7 Wh ueber - genau wie beim Originalgeraet.
+          actualValues.E_Counter = (uint32_t)(energy_mWs / 360000ULL);
 
           clock.add(*this);
         }
